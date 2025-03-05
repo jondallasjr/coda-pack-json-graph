@@ -2,14 +2,6 @@ import * as coda from "@codahq/packs-sdk";
 
 export const pack = coda.newPack();
 
-// Clean HTML content
-function cleanContent(value: any): string {
-  if (!value || typeof value !== 'string' || !value.includes('<')) {
-    return String(value || "");
-  }
-  return value.replace(/<[^>]+>/g, '').trim();
-}
-
 // Add debugging helper
 function debug(message: string, data?: any, enableDebug: boolean = false) {
   if (enableDebug) {
@@ -19,7 +11,7 @@ function debug(message: string, data?: any, enableDebug: boolean = false) {
 
 pack.addFormula({
   name: "JSONToGraph",
-  description: "Converts a JSON object into an array of graph nodes",
+  description: "Converts a JSON object into an array of graph nodes with improved hierarchy handling",
   parameters: [
     coda.makeParameter({
       type: coda.ParameterType.String,
@@ -37,7 +29,7 @@ pack.addFormula({
   items: coda.makeObjectSchema({
     properties: {
       name: { type: coda.ValueType.String, required: true },
-      value: { type: coda.ValueType.String, required: true },
+      value: { type: coda.ValueType.String, required: false },
       importParentPath: { type: coda.ValueType.String, required: false },
       parent: { type: coda.ValueType.String, required: false },
       path: { type: coda.ValueType.String, required: true },
@@ -49,52 +41,123 @@ pack.addFormula({
     try {
       const nodes = [];
       const parsed = JSON.parse(jsonString);
+      const processedPaths = new Set(); // Track already processed paths
       
       if (enableDebug) debug("Input JSON parsed:", parsed);
 
       function processObject(obj: any, path: string = '', parentPath: string | null = null, depth: number = 0) {
-        const name = path.split('.').pop() || '';
+        // Skip if we've already processed this exact path
+        if (processedPaths.has(path) && path) {
+          if (enableDebug) debug(`Skipping already processed path: ${path}`);
+          return;
+        }
+        
+        if (path) {
+          processedPaths.add(path);
+        }
+        
+        // Extract node name from path
+        const pathParts = path.split('.');
+        const name = pathParts.length > 0 ? pathParts[pathParts.length - 1] : '';
         const parent = parentPath ? parentPath.split('.').pop() || '' : '';
         
-        if (enableDebug) debug(`Processing node: ${path}`, { type: typeof obj, isArray: Array.isArray(obj) });
+        if (enableDebug) debug(`Processing node: ${path}`, { 
+          type: typeof obj, 
+          isArray: Array.isArray(obj),
+          name,
+          parent,
+          path
+        });
 
+        // Create node for current path if not empty
         if (path) {
-          // Determine the value based on the type
-          let valueStr;
+          // Determine value based on type
+          let valueStr = "";
           
-          if (typeof obj === 'object' && obj !== null) {
-            // For objects and arrays, set value to empty string or null
-            valueStr = ""; // or you could use "null" if you prefer
-          } else {
-            // For primitive values, convert to string
+          if (typeof obj !== 'object' || obj === null) {
             valueStr = String(obj);
           }
           
+          // Add the node
           const node = {
-            name,                      // The name of this node (last part of path)
-            value: valueStr,           // Empty for objects, string for primitives
-            importParentPath: parentPath, // Full path of parent
-            parent,                    // The name of the parent
-            path,                      // Full path
-            depth                      // Depth in the hierarchy
+            name,                       // Name of this node
+            value: valueStr,            // Value (empty for objects/arrays)
+            importParentPath: parentPath, // Full parent path for linking
+            parent,                     // Parent node name
+            path,                       // Full path
+            depth                       // Depth in hierarchy
           };
           
           if (enableDebug) debug(`Adding node: ${path}`, node);
           nodes.push(node);
         }
 
-        // Process children if this is an object
+        // Process children
         if (typeof obj === 'object' && obj !== null) {
           if (Array.isArray(obj)) {
-            // For arrays, process each element with index as key
+            // Handle array elements
             if (enableDebug) debug(`Processing array: ${path}`, { length: obj.length });
+            
             obj.forEach((item, index) => {
-              const newPath = path ? `${path}.${index}` : String(index);
-              processObject(item, newPath, path, depth + 1);
+              if (typeof item !== 'object' || item === null) {
+                // For primitive array items, use the value as the node name
+                const itemStr = String(item);
+                const newPath = path ? `${path}.${itemStr}` : itemStr;
+                
+                // Skip if duplicate path
+                if (processedPaths.has(newPath)) {
+                  if (enableDebug) debug(`Skipping duplicate primitive array item: ${newPath}`);
+                  return;
+                }
+                
+                processedPaths.add(newPath);
+                
+                // Create node for array value
+                const node = {
+                  name: itemStr,
+                  value: "",
+                  importParentPath: path,
+                  parent: name,
+                  path: newPath,
+                  depth: depth + 1
+                };
+                
+                if (enableDebug) debug(`Adding array value node: ${newPath}`, node);
+                nodes.push(node);
+              } else {
+                // For object array items, use index as node name
+                const indexStr = String(index);
+                const objPath = path ? `${path}.${indexStr}` : indexStr;
+                
+                // Skip if duplicate path
+                if (processedPaths.has(objPath)) {
+                  if (enableDebug) debug(`Skipping duplicate array index: ${objPath}`);
+                  return;
+                }
+                
+                processedPaths.add(objPath);
+                
+                // Create node for array index
+                const node = {
+                  name: indexStr,
+                  value: "",
+                  importParentPath: path,
+                  parent: name,
+                  path: objPath,
+                  depth: depth + 1
+                };
+                
+                if (enableDebug) debug(`Adding array index node: ${objPath}`, node);
+                nodes.push(node);
+                
+                // Process the object properties
+                processObject(item, objPath, path, depth + 1);
+              }
             });
           } else {
-            // For objects, process each property
+            // Process regular object properties
             if (enableDebug) debug(`Processing object: ${path}`, { keys: Object.keys(obj) });
+            
             Object.entries(obj).forEach(([key, value]) => {
               const newPath = path ? `${path}.${key}` : key;
               processObject(value, newPath, path, depth + 1);
@@ -103,7 +166,11 @@ pack.addFormula({
         }
       }
 
+      // Start processing from the root
       processObject(parsed);
+      
+      // Sort nodes by depth to ensure parents come before children
+      nodes.sort((a, b) => a.depth - b.depth);
       
       if (enableDebug) debug("Final nodes structure:", { count: nodes.length });
       return nodes;
@@ -113,3 +180,175 @@ pack.addFormula({
     }
   },
 });
+
+// Node interface for better type checking
+interface Node {
+  name: string;
+  value: any;
+  path: string;
+  children: string[];
+  isNumericKey: boolean;
+}
+
+interface GraphNode {
+  name: string;
+  value: any;
+  path: string;
+  children: string[];
+  depth: number;
+}
+
+
+// Define an interface for path analysis results
+interface PathAnalysisResult {
+  isNumericPath: boolean;
+  isArrayElement: boolean;
+  pathSegment: string;
+  parentIsArray: boolean;
+  arrayKeyMap: Map<string, boolean>;
+}
+
+pack.addFormula({
+  name: "SimplifiedGraphToJSON",
+  description: "Reconstructs JSON from selected nodes, their ancestors, and their direct children",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.StringArray,
+      name: "paths",
+      description: "The path values from your graph table",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.StringArray,
+      name: "names",
+      description: "The node names from your graph table",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.StringArray,
+      name: "values",
+      description: "The values from your graph table",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.StringArray,
+      name: "selectedNodes",
+      description: "List of paths of nodes to include. These nodes, their ancestors, and their direct children will be included.",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "debug",
+      description: "Enable debug logging",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.String,
+  execute: async function ([paths, names, values, selectedNodes, enableDebug = false]) {
+    if (paths.length !== names.length || paths.length !== values.length) {
+      throw new coda.UserVisibleError("All arrays must have the same length");
+    }
+
+    try {
+      // Create a map of all nodes with their path, name, and value
+      const nodeMap: Record<string, { name: string, value: any, path: string }> = {};
+      for (let i = 0; i < paths.length; i++) {
+        const path = paths[i];
+        const name = names[i];
+        const value = values[i];
+        nodeMap[path] = { name, value, path };
+      }
+
+      // Determine the full list of nodes to include
+      const nodesToInclude = new Set<string>();
+
+      // Add selected nodes and their ancestors
+      for (const selectedPath of selectedNodes) {
+        if (!nodeMap[selectedPath]) continue;
+
+        // Add the selected node
+        nodesToInclude.add(selectedPath);
+
+        // Add all ancestors
+        let currentPath = selectedPath;
+        while (currentPath.includes(".")) {
+          currentPath = currentPath.split(".").slice(0, -1).join(".");
+          nodesToInclude.add(currentPath);
+        }
+
+        // Add direct children of the selected node
+        const directChildren = paths.filter(path => {
+          const parentPath = path.split(".").slice(0, -1).join(".");
+          return parentPath === selectedPath;
+        });
+        for (const childPath of directChildren) {
+          nodesToInclude.add(childPath);
+        }
+      }
+
+      // Build the result object
+      const resultObject: Record<string, any> = {};
+
+      // Sort paths to ensure parent nodes are processed before children
+      const sortedPaths = Array.from(nodesToInclude).sort((a, b) => {
+        return a.split(".").length - b.split(".").length;
+      });
+
+      for (const path of sortedPaths) {
+        const node = nodeMap[path];
+        if (!node) continue;
+
+        const pathParts = path.split(".");
+
+        // Navigate to the correct position in the result object
+        let current = resultObject;
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          const part = pathParts[i];
+          if (!current[part] || typeof current[part] !== "object") {
+            current[part] = {};
+          }
+          current = current[part];
+        }
+
+        // Set the value for the current node
+        const lastPart = pathParts[pathParts.length - 1];
+        if (node.value !== null && node.value !== undefined && node.value !== "") {
+          current[lastPart] = convertValue(node.value);
+        } else {
+          // For nodes with no value, check if they have children
+          const children = paths.filter(p => p.startsWith(`${path}.`));
+          if (children.length > 0) {
+            // If the node has children, mark it as truncated
+            current[lastPart] = `...${children.length} items`;
+          } else {
+            // If the node has no value and no children, set it to null
+            current[lastPart] = null;
+          }
+        }
+      }
+
+      // Convert to properly formatted JSON
+      return JSON.stringify(resultObject, null, 2);
+
+    } catch (error: any) {
+      throw new coda.UserVisibleError(`Error processing graph: ${error.message}`);
+    }
+  },
+});
+
+// Helper to convert string values to the appropriate type
+function convertValue(value: any): any {
+  if (value === null || value === "") return null;
+
+  // If not a string, return as is
+  if (typeof value !== "string") return value;
+
+  // Try to convert to number
+  if (/^-?\d+(\.\d+)?$/.test(value)) {
+    const num = Number(value);
+    if (!isNaN(num)) return num;
+  }
+
+  // Try to convert to boolean
+  if (value.toLowerCase() === "true") return true;
+  if (value.toLowerCase() === "false") return false;
+
+  // Otherwise keep as string
+  return value;
+}
