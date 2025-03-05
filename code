@@ -1,0 +1,115 @@
+import * as coda from "@codahq/packs-sdk";
+
+export const pack = coda.newPack();
+
+// Clean HTML content
+function cleanContent(value: any): string {
+  if (!value || typeof value !== 'string' || !value.includes('<')) {
+    return String(value || "");
+  }
+  return value.replace(/<[^>]+>/g, '').trim();
+}
+
+// Add debugging helper
+function debug(message: string, data?: any, enableDebug: boolean = false) {
+  if (enableDebug) {
+    console.log(`DEBUG: ${message}`, JSON.stringify(data || {}, null, 2));
+  }
+}
+
+pack.addFormula({
+  name: "JSONToGraph",
+  description: "Converts a JSON object into an array of graph nodes",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "json",
+      description: "JSON string to parse",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "debug",
+      description: "Enable debug logging",
+      optional: true,
+    }),
+  ],
+  resultType: coda.ValueType.Array,
+  items: coda.makeObjectSchema({
+    properties: {
+      name: { type: coda.ValueType.String, required: true },
+      value: { type: coda.ValueType.String, required: true },
+      importParentPath: { type: coda.ValueType.String, required: false },
+      parent: { type: coda.ValueType.String, required: false },
+      path: { type: coda.ValueType.String, required: true },
+      depth: { type: coda.ValueType.Number, required: false }
+    },
+    displayProperty: "name",
+  }),
+  execute: async function ([jsonString, enableDebug = false]): Promise<any[]> {
+    try {
+      const nodes = [];
+      const parsed = JSON.parse(jsonString);
+      
+      if (enableDebug) debug("Input JSON parsed:", parsed);
+
+      function processObject(obj: any, path: string = '', parentPath: string | null = null, depth: number = 0) {
+        const name = path.split('.').pop() || '';
+        const parent = parentPath ? parentPath.split('.').pop() || '' : '';
+        
+        if (enableDebug) debug(`Processing node: ${path}`, { type: typeof obj, isArray: Array.isArray(obj) });
+
+        if (path) {
+          // Determine the value based on the type
+          let valueStr;
+          
+          if (typeof obj === 'object' && obj !== null) {
+            // For objects and arrays, set value to empty string or null
+            valueStr = ""; // or you could use "null" if you prefer
+          } else {
+            // For primitive values, convert to string
+            valueStr = String(obj);
+          }
+          
+          const node = {
+            name,                      // The name of this node (last part of path)
+            value: valueStr,           // Empty for objects, string for primitives
+            importParentPath: parentPath, // Full path of parent
+            parent,                    // The name of the parent
+            path,                      // Full path
+            depth                      // Depth in the hierarchy
+          };
+          
+          if (enableDebug) debug(`Adding node: ${path}`, node);
+          nodes.push(node);
+        }
+
+        // Process children if this is an object
+        if (typeof obj === 'object' && obj !== null) {
+          if (Array.isArray(obj)) {
+            // For arrays, process each element with index as key
+            if (enableDebug) debug(`Processing array: ${path}`, { length: obj.length });
+            obj.forEach((item, index) => {
+              const newPath = path ? `${path}.${index}` : String(index);
+              processObject(item, newPath, path, depth + 1);
+            });
+          } else {
+            // For objects, process each property
+            if (enableDebug) debug(`Processing object: ${path}`, { keys: Object.keys(obj) });
+            Object.entries(obj).forEach(([key, value]) => {
+              const newPath = path ? `${path}.${key}` : key;
+              processObject(value, newPath, path, depth + 1);
+            });
+          }
+        }
+      }
+
+      processObject(parsed);
+      
+      if (enableDebug) debug("Final nodes structure:", { count: nodes.length });
+      return nodes;
+
+    } catch (error) {
+      throw new coda.UserVisibleError(`Error processing JSON: ${error.message}`);
+    }
+  },
+});
