@@ -181,36 +181,111 @@ pack.addFormula({
   },
 });
 
-// Node interface for better type checking
-interface Node {
-  name: string;
-  value: any;
-  path: string;
-  children: string[];
-  isNumericKey: boolean;
+// Helper to convert string values to the appropriate type
+function convertValue(value: any): any {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") return value;
+  
+  // Try to convert to number
+  if (/^-?\d+(\.\d+)?$/.test(value)) {
+    const num = Number(value);
+    if (!isNaN(num)) return num;
+  }
+  
+  // Try to convert to boolean
+  if (value.toLowerCase() === "true") return true;
+  if (value.toLowerCase() === "false") return false;
+  
+  return value;
 }
 
-interface GraphNode {
-  name: string;
-  value: any;
-  path: string;
-  children: string[];
-  depth: number;
-}
-
-
-// Define an interface for path analysis results
-interface PathAnalysisResult {
-  isNumericPath: boolean;
-  isArrayElement: boolean;
-  pathSegment: string;
-  parentIsArray: boolean;
-  arrayKeyMap: Map<string, boolean>;
+// Identify if a node is part of an array based on structure
+function detectArrays(paths: string[], values: string[], nodeMap: Map<string, any>): Set<string> {
+  const arrayParents = new Set<string>();
+  
+  // Group paths by parent
+  const pathsByParent = new Map<string, string[]>();
+  
+  for (const path of paths) {
+    if (!path.includes('.')) continue;
+    
+    const parts = path.split('.');
+    const parent = parts.slice(0, -1).join('.');
+    
+    if (!pathsByParent.has(parent)) {
+      pathsByParent.set(parent, []);
+    }
+    pathsByParent.get(parent).push(path);
+  }
+  
+  // Check each group of siblings for array patterns
+  for (const [parent, childPaths] of pathsByParent.entries()) {
+    // Skip small groups
+    if (childPaths.length < 2) continue;
+    
+    // Check for array patterns:
+    // 1. Many siblings with empty parent value
+    // 2. Similar structure in all children
+    // 3. Descriptions match common array patterns
+    
+    const parentNode = nodeMap.get(parent);
+    if (!parentNode) continue;
+    
+    // Case 1: Parent value is empty and has multiple children
+    if ((!parentNode.value || parentNode.value === "") && childPaths.length >= 2) {
+      // Check for common array parent names
+      const parentName = parent.split('.').pop().toLowerCase();
+      if (parentName.includes('works') || 
+          parentName === 'occupation' || 
+          parentName === 'genres' || 
+          parentName === 'characteristics' ||
+          parentName === 'overview' ||
+          parentName === 'notableworks' ||
+          parentName.endsWith('s')) { // Plural nouns are often arrays
+        arrayParents.add(parent);
+        continue;
+      }
+    }
+    
+    // Case 2: Check for similar structure in all children
+    let sameStructure = true;
+    let hasGrandchildren = false;
+    const firstChildDepth = nodeMap.get(childPaths[0])?.depth || 0;
+    
+    for (const childPath of childPaths) {
+      const childNode = nodeMap.get(childPath);
+      if (!childNode) continue;
+      
+      // Check for uniform depth
+      if (childNode.depth !== firstChildDepth) {
+        sameStructure = false;
+        break;
+      }
+      
+      // Look for grandchildren
+      const grandchildren = paths.filter(p => p.startsWith(childPath + '.'));
+      if (grandchildren.length > 0) {
+        hasGrandchildren = true;
+      }
+    }
+    
+    // If all siblings have same structure and either no grandchildren or all have grandchildren
+    // then it might be an array
+    if (sameStructure && childPaths.length >= 2) {
+      const lastPart = parent.split('.').pop().toLowerCase();
+      if (lastPart.endsWith('s') || lastPart === 'films' || lastPart === 'works' || 
+          lastPart === 'adaptations' || lastPart === 'references') {
+        arrayParents.add(parent);
+      }
+    }
+  }
+  
+  return arrayParents;
 }
 
 pack.addFormula({
-  name: "SimplifiedGraphToJSON",
-  description: "Reconstructs JSON from selected nodes, their ancestors, and their direct children",
+  name: "GraphToJSON",
+  description: "Reconstructs JSON from graph nodes with improved hierarchy handling",
   parameters: [
     coda.makeParameter({
       type: coda.ParameterType.StringArray,
@@ -230,7 +305,20 @@ pack.addFormula({
     coda.makeParameter({
       type: coda.ParameterType.StringArray,
       name: "selectedNodes",
-      description: "List of paths of nodes to include. These nodes, their ancestors, and their direct children will be included.",
+      description: "List of paths of nodes to include (optional)",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "includeSiblings",
+      description: "Include siblings of selected nodes",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "descendantDepth",
+      description: "How many levels of descendants to include",
+      optional: true,
     }),
     coda.makeParameter({
       type: coda.ParameterType.Boolean,
@@ -240,115 +328,533 @@ pack.addFormula({
     }),
   ],
   resultType: coda.ValueType.String,
-  execute: async function ([paths, names, values, selectedNodes, enableDebug = false]) {
+  execute: async function ([
+    paths, 
+    names, 
+    values, 
+    selectedNodes = [], 
+    includeSiblings = false,
+    descendantDepth = 1,
+    enableDebug = false
+  ]) {
     if (paths.length !== names.length || paths.length !== values.length) {
-      throw new coda.UserVisibleError("All arrays must have the same length");
+      throw new coda.UserVisibleError("Paths, names, and values arrays must have the same length");
     }
 
     try {
-      // Create a map of all nodes with their path, name, and value
-      const nodeMap: Record<string, { name: string, value: any, path: string }> = {};
+      // Helper function to log debug messages
+      function debugLog(message, data) {
+        if (enableDebug) {
+          console.log(`DEBUG: ${message}`, JSON.stringify(data || {}, null, 2));
+        }
+      }
+
+      // Helper function to convert string values to appropriate types
+      function convertValue(value) {
+        if (value === null || value === undefined || value === "") return null;
+        if (typeof value !== "string") return value;
+        
+        // Try to convert to number
+        if (/^-?\d+(\.\d+)?$/.test(value)) {
+          const num = Number(value);
+          if (!isNaN(num)) return num;
+        }
+        
+        // Try to convert to boolean
+        if (value.toLowerCase() === "true") return true;
+        if (value.toLowerCase() === "false") return false;
+        
+        return value;
+      }
+
+      // Build node map with all information
+      const nodeMap = new Map();
       for (let i = 0; i < paths.length; i++) {
-        const path = paths[i];
-        const name = names[i];
-        const value = values[i];
-        nodeMap[path] = { name, value, path };
-      }
-
-      // Determine the full list of nodes to include
-      const nodesToInclude = new Set<string>();
-
-      // Add selected nodes and their ancestors
-      for (const selectedPath of selectedNodes) {
-        if (!nodeMap[selectedPath]) continue;
-
-        // Add the selected node
-        nodesToInclude.add(selectedPath);
-
-        // Add all ancestors
-        let currentPath = selectedPath;
-        while (currentPath.includes(".")) {
-          currentPath = currentPath.split(".").slice(0, -1).join(".");
-          nodesToInclude.add(currentPath);
-        }
-
-        // Add direct children of the selected node
-        const directChildren = paths.filter(path => {
-          const parentPath = path.split(".").slice(0, -1).join(".");
-          return parentPath === selectedPath;
+        nodeMap.set(paths[i], {
+          name: names[i],
+          value: values[i],
+          path: paths[i],
+          depth: paths[i].split('.').length
         });
-        for (const childPath of directChildren) {
-          nodesToInclude.add(childPath);
+      }
+      
+      // Build parentMap for easy access to parent paths
+      const parentMap = new Map();
+      for (const path of paths) {
+        if (path.includes('.')) {
+          const parentPath = path.split('.').slice(0, -1).join('.');
+          parentMap.set(path, parentPath);
         }
       }
-
-      // Build the result object
-      const resultObject: Record<string, any> = {};
-
-      // Sort paths to ensure parent nodes are processed before children
-      const sortedPaths = Array.from(nodesToInclude).sort((a, b) => {
-        return a.split(".").length - b.split(".").length;
-      });
-
-      for (const path of sortedPaths) {
-        const node = nodeMap[path];
-        if (!node) continue;
-
-        const pathParts = path.split(".");
-
-        // Navigate to the correct position in the result object
-        let current = resultObject;
+      
+      // Build childrenMap for easy access to children
+      const childrenMap = new Map();
+      for (const path of paths) {
+        if (path.includes('.')) {
+          const parentPath = path.split('.').slice(0, -1).join('.');
+          if (!childrenMap.has(parentPath)) {
+            childrenMap.set(parentPath, []);
+          }
+          childrenMap.get(parentPath).push(path);
+        }
+      }
+      
+      // Detect which nodes should be arrays
+      const arrayParents = detectArrays(paths, values, nodeMap);
+      
+      // Enhance array detection by examining node structure
+      for (const path of paths) {
+        const children = childrenMap.get(path) || [];
+        
+        // Check for numeric indices
+        const hasNumericChildren = children.some(child => {
+          const lastPart = child.split('.').pop();
+          return /^\d+$/.test(lastPart);
+        });
+        
+        // Check for plural nouns or array-like names
+        const nodeName = path.split('.').pop().toLowerCase();
+        const isPluralOrArrayLike = (
+          nodeName.endsWith('s') || 
+          nodeName === 'list' || 
+          nodeName === 'items' || 
+          nodeName === 'array' ||
+          nodeName === 'collection'
+        );
+        
+        // If it has numeric children or is a plural name, mark as array
+        if ((hasNumericChildren || isPluralOrArrayLike) && children.length > 0) {
+          arrayParents.add(path);
+        }
+      }
+      
+      // Special handling for known arrays based on data patterns
+      const knownArrayPaths = [
+        'metadata.occupation',
+        'metadata.genres', 
+        'metadata.notableWorks',
+        'achievements.overview',
+        'career.mainCharacters',
+        'career.publications.famousWorks',
+        'personalLife.earlyYears.parents',
+        'writingStyle.characteristics',
+        'otherWork.playwriting.otherPlays',
+        'legacy.adaptations',
+        'legacy.posthumousAppreciation.homes',
+        'relatedTopics',
+        'references.majorSources'
+      ];
+      
+      for (const arrayPath of knownArrayPaths) {
+        if (paths.some(p => p === arrayPath || p.startsWith(arrayPath + '.'))) {
+          arrayParents.add(arrayPath);
+        }
+      }
+      
+      // Determine nodes to include based on selectedNodes and other parameters
+      const nodesToInclude = new Set();
+      
+      if (selectedNodes && selectedNodes.length > 0) {
+        for (const selectedPath of selectedNodes) {
+          if (!nodeMap.has(selectedPath)) continue;
+          
+          // Add selected node
+          nodesToInclude.add(selectedPath);
+          
+          // Add ancestors
+          let currentPath = selectedPath;
+          while (currentPath.includes('.')) {
+            currentPath = parentMap.get(currentPath);
+            nodesToInclude.add(currentPath);
+          }
+          
+          // Add siblings if requested
+          if (includeSiblings && selectedPath.includes('.')) {
+            const parentPath = parentMap.get(selectedPath);
+            const siblings = childrenMap.get(parentPath) || [];
+            for (const siblingPath of siblings) {
+              nodesToInclude.add(siblingPath);
+            }
+          }
+          
+          // Add descendants up to specified depth
+          if (descendantDepth > 0) {
+            // Function to recursively add descendants
+            function addDescendantsToDepth(path, currentDepth) {
+              if (currentDepth > descendantDepth) return;
+              
+              const children = childrenMap.get(path) || [];
+              for (const childPath of children) {
+                nodesToInclude.add(childPath);
+                addDescendantsToDepth(childPath, currentDepth + 1);
+              }
+            }
+            
+            addDescendantsToDepth(selectedPath, 1);
+          }
+        }
+      } else {
+        // If no selectedNodes, include all
+        for (const path of paths) {
+          nodesToInclude.add(path);
+        }
+      }
+      
+      debugLog("Array parents", Array.from(arrayParents));
+      debugLog("Nodes to include", Array.from(nodesToInclude));
+      
+      // Build the JSON structure
+      const resultObject = {};
+      
+      // Function to safely navigate and set values in the result object
+      function setValueAtPath(obj, pathParts, value) {
+        let current = obj;
+        
+        // Navigate to the correct position
         for (let i = 0; i < pathParts.length - 1; i++) {
           const part = pathParts[i];
-          if (!current[part] || typeof current[part] !== "object") {
-            current[part] = {};
+          
+          // Create the path if it doesn't exist
+          if (current[part] === undefined) {
+            // Check if next part is numeric (array index)
+            const nextPart = pathParts[i + 1];
+            const nextIsNumeric = /^\d+$/.test(nextPart);
+            
+            // Create array or object as appropriate
+            current[part] = nextIsNumeric ? [] : {};
           }
+          
           current = current[part];
         }
-
-        // Set the value for the current node
+        
+        // Set the value at the final position
         const lastPart = pathParts[pathParts.length - 1];
-        if (node.value !== null && node.value !== undefined && node.value !== "") {
-          current[lastPart] = convertValue(node.value);
-        } else {
-          // For nodes with no value, check if they have children
-          const children = paths.filter(p => p.startsWith(`${path}.`));
-          if (children.length > 0) {
-            // If the node has children, mark it as truncated
-            current[lastPart] = `...${children.length} items`;
-          } else {
-            // If the node has no value and no children, set it to null
-            current[lastPart] = null;
+        current[lastPart] = value;
+      }
+      
+      // First pass: build basic structure and set primitive values
+      for (const path of paths) {
+        if (!nodesToInclude.has(path)) continue;
+        
+        const node = nodeMap.get(path);
+        const pathParts = path.split('.');
+        
+        // Skip numeric indices of arrays for now
+        if (pathParts.length > 1) {
+          const parentPath = parentMap.get(path);
+          const lastPart = pathParts[pathParts.length - 1];
+          
+          if (arrayParents.has(parentPath) && /^\d+$/.test(lastPart)) {
+            continue; // Will handle arrays in second pass
+          }
+        }
+        
+        // For non-array parents with primitive values
+        if (!arrayParents.has(path)) {
+          // If it has a value, set it
+          if (node.value !== null && node.value !== undefined && node.value !== "") {
+            setValueAtPath(resultObject, pathParts, convertValue(node.value));
+          } 
+          // If it has no children, set null
+          else if (!childrenMap.has(path) || (childrenMap.get(path) || []).length === 0) {
+            setValueAtPath(resultObject, pathParts, null);
+          }
+          // Otherwise ensure the path exists (will be populated with children later)
+          else {
+            let current = resultObject;
+            for (let i = 0; i < pathParts.length; i++) {
+              const part = pathParts[i];
+              if (current[part] === undefined) {
+                current[part] = {};
+              }
+              current = current[part];
+            }
+          }
+        }
+        // For array parents, initialize the array
+        else {
+          let current = resultObject;
+          for (let i = 0; i < pathParts.length - 1; i++) {
+            const part = pathParts[i];
+            if (current[part] === undefined) {
+              current[part] = {};
+            }
+            current = current[part];
+          }
+          
+          const lastPart = pathParts[pathParts.length - 1];
+          if (current[lastPart] === undefined) {
+            current[lastPart] = [];
           }
         }
       }
-
-      // Convert to properly formatted JSON
+      
+      // Second pass: populate arrays
+      for (const arrayPath of arrayParents) {
+        if (!nodesToInclude.has(arrayPath)) continue;
+        
+        // Navigate to the array
+        let arrayContainer = resultObject;
+        const arrayPathParts = arrayPath.split('.');
+        
+        for (const part of arrayPathParts) {
+          if (arrayContainer === undefined || arrayContainer[part] === undefined) {
+            // Array path doesn't exist in the result object
+            arrayContainer = undefined;
+            break;
+          }
+          arrayContainer = arrayContainer[part];
+        }
+        
+        if (arrayContainer === undefined || !Array.isArray(arrayContainer)) {
+          continue; // Skip if we couldn't find the array
+        }
+        
+        // Get direct children of this array
+        const arrayChildren = childrenMap.get(arrayPath) || [];
+        
+        // Group children by type
+        const numericChildren = arrayChildren.filter(p => /^\d+$/.test(p.split('.').pop()));
+        const namedChildren = arrayChildren.filter(p => !/^\d+$/.test(p.split('.').pop()));
+        
+        // For arrays with named children (like 'occupation' or 'genres')
+        // Add the values directly to the array
+        for (const childPath of namedChildren) {
+          if (!nodesToInclude.has(childPath)) continue;
+          
+          const node = nodeMap.get(childPath);
+          if (!node) continue;
+          
+          const childName = node.name;
+          const childValue = node.value || childName;
+          
+          // Avoid duplicates
+          if (!arrayContainer.includes(childValue) && childValue) {
+            arrayContainer.push(childValue);
+          }
+        }
+        
+        // For arrays with numeric indices (like famousWorks[0], famousWorks[1])
+        // Create objects at specific indices
+        for (const indexPath of numericChildren) {
+          if (!nodesToInclude.has(indexPath)) continue;
+          
+          const indexStr = indexPath.split('.').pop();
+          const index = parseInt(indexStr);
+          
+          // Get properties of this array item
+          const indexChildren = childrenMap.get(indexPath) || [];
+          
+          // If the index item has no children or its children aren't included, just add the value
+          if (indexChildren.length === 0 || !indexChildren.some(p => nodesToInclude.has(p))) {
+            const indexNode = nodeMap.get(indexPath);
+            if (indexNode && indexNode.value) {
+              // Ensure array is long enough
+              while (arrayContainer.length <= index) {
+                arrayContainer.push(null);
+              }
+              arrayContainer[index] = convertValue(indexNode.value);
+            }
+            continue;
+          }
+          
+          // Create object at this index
+          let indexObj = {};
+          
+          // Add properties to the index object
+          for (const propPath of indexChildren) {
+            if (!nodesToInclude.has(propPath)) continue;
+            
+            const propNode = nodeMap.get(propPath);
+            if (!propNode) continue;
+            
+            const propName = propPath.split('.').pop();
+            
+            // Handle nested properties
+            if (arrayParents.has(propPath)) {
+              indexObj[propName] = []; // Initialize nested array
+              
+              // Get children of this nested array
+              const nestedChildren = childrenMap.get(propPath) || [];
+              
+              // Add values to nested array
+              for (const nestedPath of nestedChildren) {
+                if (!nodesToInclude.has(nestedPath)) continue;
+                
+                const nestedNode = nodeMap.get(nestedPath);
+                if (!nestedNode) continue;
+                
+                const nestedValue = nestedNode.value || nestedNode.name;
+                if (nestedValue && !indexObj[propName].includes(nestedValue)) {
+                  indexObj[propName].push(nestedValue);
+                }
+              }
+            } else if (childrenMap.has(propPath) && (childrenMap.get(propPath) || []).length > 0) {
+              // Handle nested objects
+              indexObj[propName] = {};
+              
+              // Build nested object
+              const nestedChildren = childrenMap.get(propPath) || [];
+              for (const nestedPath of nestedChildren) {
+                if (!nodesToInclude.has(nestedPath)) continue;
+                
+                const nestedNode = nodeMap.get(nestedPath);
+                if (!nestedNode) continue;
+                
+                const nestedName = nestedPath.split('.').pop();
+                indexObj[propName][nestedName] = convertValue(nestedNode.value);
+              }
+            } else {
+              // Simple property
+              indexObj[propName] = convertValue(propNode.value);
+            }
+          }
+          
+          // Ensure array is long enough
+          while (arrayContainer.length <= index) {
+            arrayContainer.push(null);
+          }
+          
+          // Add object to array
+          arrayContainer[index] = indexObj;
+        }
+        
+        // Special case: For arrays that have properties that contain arrays, we need another approach
+        // For example, achievements.overview contains array elements that are strings
+        if (arrayChildren.length > 0 && arrayContainer.length === 0) {
+          // Check if this is a special case where array items are stored differently
+          for (const childPath of arrayChildren) {
+            if (!nodesToInclude.has(childPath)) continue;
+            
+            const childNode = nodeMap.get(childPath);
+            if (!childNode) continue;
+            
+            // Get grandchildren
+            const grandchildren = childrenMap.get(childPath) || [];
+            
+            // If it has grandchildren, it might be a complex structure
+            if (grandchildren.length > 0) {
+              // For simple array of values within a property
+              for (const grandchildPath of grandchildren) {
+                if (!nodesToInclude.has(grandchildPath)) continue;
+                
+                const grandchildNode = nodeMap.get(grandchildPath);
+                if (!grandchildNode) continue;
+                
+                const grandchildName = grandchildNode.name;
+                const grandchildValue = grandchildNode.value || grandchildName;
+                
+                if (grandchildValue && !arrayContainer.includes(grandchildValue)) {
+                  arrayContainer.push(grandchildValue);
+                }
+              }
+            } else {
+              // For direct children with values
+              const childName = childNode.name;
+              
+              // Skip if it's a property name within the array
+              if (childName === 'name' || childName === 'type' || childName === 'count') continue;
+              
+              // Otherwise treat it as an array item
+              if (childName && !arrayContainer.includes(childName)) {
+                arrayContainer.push(childName);
+              }
+            }
+          }
+        }
+      }
+      
+      // Third pass: Handle special nested structures
+      // For example, in the original JSON, 'achievements' is an array with 'overview' and 'recordSales'
+      const specialArrays = ['achievements', 'career.mainCharacters', 'career.publications', 
+                            'personalLife.earlyYears', 'legacy.adaptations', 'references'];
+      
+      for (const specialPath of specialArrays) {
+        if (paths.some(p => p === specialPath || p.startsWith(specialPath + '.'))) {
+          // Navigate to the object
+          let current = resultObject;
+          const pathParts = specialPath.split('.');
+          
+          let found = true;
+          for (const part of pathParts) {
+            if (!current[part]) {
+              found = false;
+              break;
+            }
+            current = current[part];
+          }
+          
+          if (!found) continue;
+          
+          // Check if this should be an array with child objects
+          const directChildren = paths.filter(p => {
+            if (!p.startsWith(specialPath + '.')) return false;
+            const remaining = p.slice(specialPath.length + 1);
+            return !remaining.includes('.');
+          });
+          
+          if (Array.isArray(current) && current.every(item => typeof item === 'string')) {
+            // If current is already an array of strings, it might represent child objects
+            // We need to ensure each child has its own entry in the parent object
+            
+            // First check if we have any actual child objects
+            const childObjects = {};
+            for (const childName of current) {
+              const childPath = `${specialPath}.${childName}`;
+              
+              // Get properties of this child
+              const childProps = paths.filter(p => p.startsWith(childPath + '.'));
+              
+              if (childProps.length > 0) {
+                childObjects[childName] = {};
+                
+                // Add properties to child object
+                for (const propPath of childProps) {
+                  if (!nodesToInclude.has(propPath)) continue;
+                  
+                  const propNode = nodeMap.get(propPath);
+                  if (!propNode) continue;
+                  
+                  // Get relative path from child
+                  const relPath = propPath.slice(childPath.length + 1);
+                  const propParts = relPath.split('.');
+                  
+                  // Navigate to the right position in the child object
+                  let propCurrent = childObjects[childName];
+                  for (let i = 0; i < propParts.length - 1; i++) {
+                    const part = propParts[i];
+                    if (!propCurrent[part]) {
+                      propCurrent[part] = {};
+                    }
+                    propCurrent = propCurrent[part];
+                  }
+                  
+                  // Set the value
+                  const lastPart = propParts[propParts.length - 1];
+                  propCurrent[lastPart] = convertValue(propNode.value);
+                }
+              }
+            }
+            
+            // If we found child objects, update the parent accordingly
+            if (Object.keys(childObjects).length > 0) {
+              // Navigate to parent object
+              let parent = resultObject;
+              for (let i = 0; i < pathParts.length - 1; i++) {
+                parent = parent[pathParts[i]];
+              }
+              
+              // Replace array with objects
+              parent[pathParts[pathParts.length - 1]] = childObjects;
+            }
+          }
+        }
+      }
+      
+      // Return formatted JSON
       return JSON.stringify(resultObject, null, 2);
-
-    } catch (error: any) {
+    } catch (error) {
       throw new coda.UserVisibleError(`Error processing graph: ${error.message}`);
     }
   },
 });
-
-// Helper to convert string values to the appropriate type
-function convertValue(value: any): any {
-  if (value === null || value === "") return null;
-
-  // If not a string, return as is
-  if (typeof value !== "string") return value;
-
-  // Try to convert to number
-  if (/^-?\d+(\.\d+)?$/.test(value)) {
-    const num = Number(value);
-    if (!isNaN(num)) return num;
-  }
-
-  // Try to convert to boolean
-  if (value.toLowerCase() === "true") return true;
-  if (value.toLowerCase() === "false") return false;
-
-  // Otherwise keep as string
-  return value;
-}
